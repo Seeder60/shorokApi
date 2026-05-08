@@ -2,9 +2,11 @@ import time
 import uuid
 import httpx
 import logging
-from fastapi import FastAPI, Request
+from typing import Callable
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
 
 from source.utils import gis_engine, ALLOWED_ORIGINS
@@ -53,6 +55,43 @@ tags_metadata = [
 ]
 
 # =========================
+# OPTIONS PREFLIGHT BYPASS
+# Starlette middleware is LIFO — last added = first executed.
+# Registered last below so it runs first — before api_key_dep.
+# =========================
+ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
+ALLOWED_HEADERS = ["X-API-Key", "Content-Type", "Authorization", "Accept", "Origin"]
+
+class CORSPreflightMiddleware(BaseHTTPMiddleware):
+    """
+    Short-circuits OPTIONS preflight before api_key_dep ever sees it.
+    Without this, Header(...) on api_key_dep raises 422 on every OPTIONS
+    request — browser never sends X-API-Key on preflight by design.
+    """
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        if request.method == "OPTIONS":
+            origin = request.headers.get("origin", "")
+            logger.debug("OPTIONS preflight: origin=%s path=%s", origin, request.url.path)
+
+            if origin and origin not in ALLOWED_ORIGINS:
+                logger.warning("CORS blocked preflight from unlisted origin: %s", origin)
+                return Response(status_code=403, content="Origin not allowed")
+
+            return Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": origin or "*",
+                    "Access-Control-Allow-Methods": ", ".join(ALLOWED_METHODS),
+                    "Access-Control-Allow-Headers": ", ".join(ALLOWED_HEADERS),
+                    "Access-Control-Allow-Credentials": "true",
+                    "Access-Control-Max-Age": "600",
+                },
+            )
+
+        response = await call_next(request)
+        return response
+
+# =========================
 # APP CONFIG
 # =========================
 @asynccontextmanager
@@ -85,6 +124,28 @@ app = FastAPI(
     }
 )
 
+# =========================
+# MIDDLEWARE REGISTRATION
+# Starlette LIFO — last added = first to execute at runtime:
+#   add_middleware(GZipMiddleware)            runs 4th
+#   add_middleware(CORSMiddleware)            runs 3rd — adds CORS headers
+#   @app.middleware production_middleware     runs 2nd — adds X-Request-ID
+#   add_middleware(CORSPreflightMiddleware)   runs 1st — intercepts OPTIONS
+# =========================
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# FIX 1: allow_credentials=True — required when frontend sends custom header
+# FIX 2: allow_methods expanded — was missing PUT/DELETE
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=ALLOWED_METHODS,
+    allow_headers=ALLOWED_HEADERS,
+    max_age=600,
+)
+
 @app.middleware("http")
 async def production_middleware(request: Request, call_next):
     start_time = time.time()
@@ -94,18 +155,13 @@ async def production_middleware(request: Request, call_next):
     response.headers["X-Process-Time"] = str(time.time() - start_time)
     return response
 
-app.add_middleware(GZipMiddleware, minimum_size=1000)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["X-API-Key", "Content-Type", "Authorization"],
-)
+# FIX 3: OPTIONS bypass registered LAST so it runs FIRST (LIFO)
+app.add_middleware(CORSPreflightMiddleware)
 
 # =========================
 # ROUTER REGISTRATION
 # =========================
-app.include_router(sys_router)  # Root, health, status
+app.include_router(sys_router)   # Root, health, status
 app.include_router(keys_router)
 app.include_router(spatial_router)
 app.include_router(ws_router)
