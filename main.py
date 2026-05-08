@@ -26,84 +26,103 @@ description = """
 ShorokAPI provides high-performance geospatial data, real-time traffic updates, and public transport routing optimized for the unique infrastructure of Bangladesh.
 
 #### 🔐 Authentication
-All requests (except health checks) require an API Key:
-- **Standard API Key**: Pass via the `X-API-Key` header.
-- **Administrative Key**: Pass via the `X-Admin-Key` header for management endpoints.
+All requests (except `/`, `/health`, `/status`, `/version`) require an API Key:
+- **Header**: `X-API-Key: <your_token>`
+
+> **Note:** `X-API-ID` has been removed. Use only `X-API-Key`.
 
 #### 🚦 Rate Limiting
-Usage is tracked daily based on your subscription tier:
 - **Free**: 1,000 requests/day
 - **Standard**: 10,000 requests/day
 - **Pro**: 1,000,000 requests/day
 
 #### 🛰️ Real-time Updates
-Use our WebSocket endpoint at `/v1/live/ws?token={your_key}` for live traffic telemetry streams.
+WebSocket at `/v1/live/ws?token={your_key}` — pass the raw API key as the query param.
 
 #### 🗺️ Data Standards
-- **Spatial Data**: Responses follow the GeoJSON `Feature` or `FeatureCollection` format.
-- **Geometry**: EPSG:4326 (WGS 84) coordinate system.
+- Spatial responses follow GeoJSON `FeatureCollection` format.
+- Geometry: EPSG:4326 (WGS 84).
 """
 
 tags_metadata = [
     {"name": "Platform Management", "description": "Core system status and health monitoring."},
-    {"name": "Identity & Access", "description": "API key generation and usage analytics."},
-    {"name": "Spatial Intelligence", "description": "Road network queries, reverse geocoding, and GIS lookups."},
+    {"name": "Identity & Access",   "description": "API key generation and usage analytics."},
+    {"name": "Spatial Intelligence","description": "Road network queries, reverse geocoding, and GIS lookups."},
     {"name": "Traffic & Incidents", "description": "Crowdsourced reports and live road conditions."},
     {"name": "Transit & Logistics", "description": "Bus routes, stops, and fare estimation logic."},
-    {"name": "Routing Engine", "description": "Point-to-point directions powered by OSRM."},
-    {"name": "Real-time Updates", "description": "WebSocket streams for low-latency telemetry."},
+    {"name": "Routing Engine",      "description": "Point-to-point directions powered by OSRM."},
+    {"name": "Real-time Updates",   "description": "WebSocket streams for low-latency telemetry."},
 ]
 
 # =========================
-# OPTIONS PREFLIGHT BYPASS
-# Starlette middleware is LIFO — last added = first executed.
-# Registered last below so it runs first — before api_key_dep.
+# CORS CONSTANTS
+# Single source of truth — also used by CORSPreflightMiddleware below.
 # =========================
-ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
-ALLOWED_HEADERS = ["X-API-Key", "Content-Type", "Authorization", "Accept", "Origin"]
+CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
+CORS_ALLOW_HEADERS = ["X-API-Key", "Content-Type", "Authorization", "apikey", "Accept", "Origin"]
 
+# =========================
+# OPTIONS PREFLIGHT MIDDLEWARE
+#
+# WHY THIS EXISTS:
+#   api_key_dep uses Header(...) — a required FastAPI dependency.
+#   Browsers NEVER send X-API-Key on OPTIONS preflight by spec.
+#   Result without this: FastAPI raises 422 before CORS headers attach.
+#   This middleware intercepts OPTIONS first, returns 200 immediately.
+#
+# REGISTRATION ORDER (Starlette middleware stack is LIFO):
+#   add_middleware(GZipMiddleware)          → executes 4th
+#   add_middleware(CORSMiddleware)          → executes 3rd
+#   @app.middleware production_middleware   → executes 2nd
+#   add_middleware(CORSPreflightMiddleware) → executes 1st  ← registered last
+# =========================
 class CORSPreflightMiddleware(BaseHTTPMiddleware):
-    """
-    Short-circuits OPTIONS preflight before api_key_dep ever sees it.
-    Without this, Header(...) on api_key_dep raises 422 on every OPTIONS
-    request — browser never sends X-API-Key on preflight by design.
-    """
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        origin = request.headers.get("origin", "")
+
         if request.method == "OPTIONS":
-            origin = request.headers.get("origin", "")
-            logger.debug("OPTIONS preflight: origin=%s path=%s", origin, request.url.path)
+            logger.debug("PREFLIGHT  origin=%-40s  path=%s", origin or "(none)", request.url.path)
 
             if origin and origin not in ALLOWED_ORIGINS:
-                logger.warning("CORS blocked preflight from unlisted origin: %s", origin)
+                logger.warning("CORS BLOCK  preflight from unlisted origin: %s  path=%s", origin, request.url.path)
                 return Response(status_code=403, content="Origin not allowed")
 
             return Response(
                 status_code=200,
                 headers={
-                    "Access-Control-Allow-Origin": origin or "*",
-                    "Access-Control-Allow-Methods": ", ".join(ALLOWED_METHODS),
-                    "Access-Control-Allow-Headers": ", ".join(ALLOWED_HEADERS),
+                    "Access-Control-Allow-Origin":      origin or "*",
+                    "Access-Control-Allow-Methods":     ", ".join(CORS_ALLOW_METHODS),
+                    "Access-Control-Allow-Headers":     ", ".join(CORS_ALLOW_HEADERS),
                     "Access-Control-Allow-Credentials": "true",
-                    "Access-Control-Max-Age": "600",
+                    "Access-Control-Max-Age":           "600",
                 },
             )
 
         response = await call_next(request)
+
+        # Log any request from an origin not in our allowlist (real requests, not OPTIONS)
+        if origin and origin not in ALLOWED_ORIGINS:
+            logger.warning(
+                "CORS WARN   origin not in allowlist: %s  method=%s  path=%s  status=%s",
+                origin, request.method, request.url.path, response.status_code
+            )
+
         return response
+
 
 # =========================
 # APP CONFIG
 # =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("ShorokAPI Engine starting up...")
+    logger.info("ShorokAPI starting — origins=%s", ALLOWED_ORIGINS)
     gis_engine._client = httpx.AsyncClient(
         timeout=10.0,
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
     )
     yield
     await gis_engine.client.aclose()
-    logger.info("ShorokAPI Engine shutting down...")
+    logger.info("ShorokAPI shutting down.")
 
 app = FastAPI(
     title="ShorokAPI Bangladesh",
@@ -113,55 +132,44 @@ app = FastAPI(
     docs_url="/portal",
     redoc_url="/docs",
     openapi_tags=tags_metadata,
-    contact={
-        "name": "ShorokAPI Support",
-        "url": "https://shorokapi.dev/support",
-        "email": "dev@shorokapi.dev",
-    },
-    license_info={
-        "name": "GPL-3.0",
-        "url": "https://www.gnu.org/licenses/gpl-3.0.html",
-    }
+    contact={"name": "ShorokAPI Support", "url": "https://shorokapi.dev/support", "email": "dev@shorokapi.dev"},
+    license_info={"name": "GPL-3.0", "url": "https://www.gnu.org/licenses/gpl-3.0.html"},
 )
 
 # =========================
-# MIDDLEWARE REGISTRATION
-# Starlette LIFO — last added = first to execute at runtime:
-#   add_middleware(GZipMiddleware)            runs 4th
-#   add_middleware(CORSMiddleware)            runs 3rd — adds CORS headers
-#   @app.middleware production_middleware     runs 2nd — adds X-Request-ID
-#   add_middleware(CORSPreflightMiddleware)   runs 1st — intercepts OPTIONS
+# MIDDLEWARE — order matters (LIFO execution)
 # =========================
 
+# 4th to execute — compress responses
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# FIX 1: allow_credentials=True — required when frontend sends custom header
-# FIX 2: allow_methods expanded — was missing PUT/DELETE
+# 3rd to execute — attach CORS headers on real (non-OPTIONS) responses
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=ALLOWED_METHODS,
-    allow_headers=ALLOWED_HEADERS,
+    allow_credentials=True,                  # required: browser sends X-API-Key custom header
+    allow_methods=CORS_ALLOW_METHODS,
+    allow_headers=CORS_ALLOW_HEADERS,
     max_age=600,
 )
 
+# 2nd to execute — request tracing
 @app.middleware("http")
 async def production_middleware(request: Request, call_next):
-    start_time = time.time()
-    request_id = str(uuid.uuid4())
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = str(request_id)
-    response.headers["X-Process-Time"] = str(time.time() - start_time)
+    start_time  = time.time()
+    request_id  = str(uuid.uuid4())
+    response    = await call_next(request)
+    response.headers["X-Request-ID"]   = request_id
+    response.headers["X-Process-Time"] = f"{time.time() - start_time:.4f}"
     return response
 
-# FIX 3: OPTIONS bypass registered LAST so it runs FIRST (LIFO)
+# 1st to execute — OPTIONS bypass (registered last = runs first in LIFO)
 app.add_middleware(CORSPreflightMiddleware)
 
 # =========================
-# ROUTER REGISTRATION
+# ROUTER REGISTRATION — always after all middleware
 # =========================
-app.include_router(sys_router)   # Root, health, status
-app.include_router(keys_router)
-app.include_router(spatial_router)
-app.include_router(ws_router)
+app.include_router(sys_router)      # /, /health, /status, /version
+app.include_router(keys_router)     # /v1/keys/*
+app.include_router(spatial_router)  # /v1/roads, /v1/traffic, etc.
+app.include_router(ws_router)       # /v1/live/ws
