@@ -25,7 +25,19 @@ if missing:
 SUPABASE_URL = os.getenv("SUPABASE_URL").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OSRM_URL = os.getenv("OSRM_URL", "http://router.project-osrm.org").rstrip("/")
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://shorokapi.dev").split(",")
+
+# ALLOWED_ORIGINS: set via env var in production (comma-separated).
+# Default includes localhost ports for local development.
+_default_origins = ",".join([
+    "https://shorokapi.dev",
+    "https://www.shorokapi.dev",
+    "http://localhost:8080",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:3000",
+])
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", _default_origins).split(",")
 
 class GISClient:
     """High-performance singleton for GIS and Auth database communication."""
@@ -79,7 +91,7 @@ def standardize_response(data: Any, status: str = "success"):
     # If data is GeoJSON collection, extract count from features
     if isinstance(data, dict) and data.get("type") == "FeatureCollection":
         count = len(data.get("features", []))
-    
+
     return {
         "status": status,
         "count": count,
@@ -90,7 +102,7 @@ def to_geojson(data: Any, geom_key: str = "wkt_geometry") -> Dict[str, Any]:
     """Converts database records into valid GeoJSON FeatureCollection."""
     if not isinstance(data, list):
         data = [data] if data else []
-        
+
     features = []
     for item in data:
         geometry = item.get(geom_key)
@@ -98,8 +110,9 @@ def to_geojson(data: Any, geom_key: str = "wkt_geometry") -> Dict[str, Any]:
         if isinstance(geometry, str) and (geometry.startswith('{') or geometry.startswith('[')):
             try:
                 geometry = json.loads(geometry)
-            except: pass
-            
+            except:
+                pass
+
         feat = {
             "type": "Feature",
             "properties": {k: v for k, v in item.items() if k != geom_key},
