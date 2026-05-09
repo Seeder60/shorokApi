@@ -3,7 +3,7 @@ auth.py — ShorokAPI Identity & Access Management
 =================================================
 Connects to: api(base) Supabase project
   APIBASE_URL  → https://gwaaslvzthwafeymdkcs.supabase.co  (from Render env)
-  APIBASE_KEY  → service role / anon key for api(base) project
+  APIBASE_KEY  → service role key for api(base) project
 
 This is a SEPARATE Supabase project from shorokApi.
   api(base) tables: api_keys, api_logs
@@ -15,10 +15,10 @@ Auth uses ONLY X-API-Key. X-API-ID removed entirely.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import os
 import secrets
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
@@ -32,21 +32,21 @@ logger = logging.getLogger("shorok.auth")
 load_dotenv()
 
 # ─── api(base) Supabase credentials ──────────────────────────────────────────
-# Render env vars: APIBASE_URL, APIBASE_KEY, APIBASE_MASTERKEY (or MASTER_KEY)
 APIBASE_URL: str = os.getenv("APIBASE_URL", "").rstrip("/")
 APIBASE_KEY: str = os.getenv("APIBASE_KEY", "")
 
-# Accept both APIBASE_MASTERKEY and MASTER_KEY (screenshot shows MASTER_KEY in Render)
-APIBASE_MASTERKEY: str = (
-    os.getenv("APIBASE_MASTERKEY")
-    or os.getenv("MASTER_KEY")
-    or "dev-master-key"
-)
+APIBASE_MASTERKEY: str = os.getenv("APIBASE_MASTERKEY") or os.getenv("MASTER_KEY") or ""
 
 if not APIBASE_URL or not APIBASE_KEY:
     logger.warning(
         "AUTH: APIBASE_URL or APIBASE_KEY not set — "
         "key validation will fail. Set these in Render environment."
+    )
+
+if not APIBASE_MASTERKEY:
+    raise RuntimeError(
+        "CRITICAL: APIBASE_MASTERKEY (or MASTER_KEY) env var is not set. "
+        "Set it in Render environment before deploying."
     )
 
 TIER_LIMITS: dict[str, int] = {
@@ -60,10 +60,7 @@ TIER_LIMITS: dict[str, int] = {
 class AuthClient:
     """
     Persistent async HTTP client for the api(base) Supabase project.
-    Manages api_keys and api_logs tables.
-
-    Uses a single shared httpx.AsyncClient (initialised at lifespan startup)
-    instead of a new client per request — avoids socket exhaustion under load.
+    Uses a single shared httpx.AsyncClient — avoids socket exhaustion under load.
     """
 
     def __init__(self):
@@ -86,7 +83,25 @@ class AuthClient:
             )
         return self._client
 
+    async def check_and_log_usage(self, key_hash: str, endpoint: str, method: str) -> dict[str, Any]:
+        """
+        Single atomic DB call via RPC: validates the key, checks rate limit,
+        and logs the request — eliminating the TOCTOU race on concurrent requests.
+        """
+        try:
+            r = await self.client.post(
+                f"{self.base_url}/rpc/check_and_log_usage",
+                headers=self._headers,
+                json={"p_key_hash": key_hash, "p_endpoint": endpoint, "p_method": method},
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.error("AUTH DB  check_and_log_usage failed: %s", str(e))
+            return {"allowed": False, "reason": "db_error"}
+
     async def get_key_metadata(self, key_hash: str) -> Optional[dict[str, Any]]:
+        """Used by WebSocket auth (which bypasses the normal HTTP dependency chain)."""
         try:
             r = await self.client.get(
                 f"{self.base_url}/api_keys",
@@ -100,58 +115,38 @@ class AuthClient:
             logger.error("AUTH DB  get_key_metadata failed: %s", str(e))
             return None
 
-    async def get_usage_count(self, key_hash: str) -> int:
-        today = datetime.now(timezone.utc).date().isoformat()
-        try:
-            r = await self.client.get(
-                f"{self.base_url}/api_logs",
-                headers={**self._headers, "Prefer": "count=exact", "Range": "0-0"},
-                params={"key_hash": f"eq.{key_hash}", "log_date": f"eq.{today}"},
+    async def create_new_key(self, email: str, app_name: str, tier: str) -> dict[str, Any]:
+        if tier not in TIER_LIMITS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid tier '{tier}'. Must be one of: {list(TIER_LIMITS)}",
             )
-            r.raise_for_status()
-            cr = r.headers.get("Content-Range", "*/0")
-            return int(cr.split("/")[-1])
-        except Exception as e:
-            logger.error("AUTH DB  get_usage_count failed: %s", str(e))
-            return 0  # Fail open on count — don't block valid keys if DB hiccups
-
-    async def record_analytics(self, key_hash: str, endpoint: str, method: str, status: int) -> None:
+        raw_token = f"shorok_{secrets.token_urlsafe(32)}"
+        khash = hashlib.sha256(raw_token.encode()).hexdigest()
         try:
             r = await self.client.post(
-                f"{self.base_url}/api_logs",
-                headers={**self._headers, "Prefer": "return=minimal"},
+                f"{self.base_url}/api_keys",
+                headers={**self._headers, "Prefer": "return=representation"},
                 json={
-                    "key_hash":    key_hash,
-                    "endpoint":    endpoint,
-                    "method":      method,
-                    "status_code": status,
-                    "log_date":    datetime.now(timezone.utc).date().isoformat(),
+                    "key_hash":    khash,
+                    "email":       email,
+                    "app_name":    app_name,
+                    "tier":        tier,
+                    "daily_limit": TIER_LIMITS[tier],
                 },
             )
             r.raise_for_status()
+            res = r.json()
+            if not res:
+                raise HTTPException(status_code=500, detail="Key creation returned empty response")
+            res[0]["raw_key"] = raw_token
+            logger.info("AUTH  new key created  email=%s  tier=%s", email, tier)
+            return res[0]
+        except HTTPException:
+            raise
         except Exception as e:
-            # Non-fatal — don't let analytics failures break real requests
-            logger.warning("AUTH DB  record_analytics failed (non-fatal): %s", str(e))
-
-    async def create_new_key(self, email: str, app_name: str, tier: str) -> dict[str, Any]:
-        raw_token = f"shorok_{secrets.token_urlsafe(32)}"
-        khash = hashlib.sha256(raw_token.encode()).hexdigest()
-        r = await self.client.post(
-            f"{self.base_url}/api_keys",
-            headers={**self._headers, "Prefer": "return=representation"},
-            json={
-                "key_hash":    khash,
-                "email":       email,
-                "app_name":    app_name,
-                "tier":        tier,
-                "daily_limit": TIER_LIMITS.get(tier, 1000),
-            },
-        )
-        r.raise_for_status()
-        res = r.json()
-        res[0]["raw_key"] = raw_token
-        logger.info("AUTH  new key created  email=%s  tier=%s", email, tier)
-        return res[0]
+            logger.error("AUTH  create_new_key failed: %s", str(e))
+            raise HTTPException(status_code=500, detail="Failed to create API key")
 
 
 # Singleton — imported by websocket_routes.py
@@ -169,41 +164,35 @@ async def api_key_dep(
     x_api_key: str = Header(..., alias="X-API-Key", description="Active ShorokAPI token"),
 ) -> dict:
     """
-    Validates X-API-Key against the api(base) Supabase project.
+    Validates X-API-Key via a single atomic DB call that checks validity,
+    enforces rate limits, and logs the request in one transaction.
 
-    OPTIONS requests are intercepted by CORSPreflightMiddleware in main.py
-    before routing — this function is never called for preflight.
+    OPTIONS requests are intercepted by CORSPreflightMiddleware before routing.
     """
     if request.method == "OPTIONS":
-        # Safety net only — middleware should prevent reaching here
-        logger.warning("AUTH  OPTIONS reached api_key_dep — middleware misconfigured")
         return {}
 
-    khash    = hash_token(x_api_key)
-    metadata = await auth_client.get_key_metadata(khash)
+    khash = hash_token(x_api_key)
+    result = await auth_client.check_and_log_usage(
+        khash, str(request.url.path), request.method
+    )
 
-    if not metadata or not metadata.get("active"):
-        logger.warning("AUTH REJECT  hash=%.16s...  path=%s", khash, request.url.path)
+    if not result.get("allowed"):
+        reason = result.get("reason", "unknown")
+        if reason == "rate_limit":
+            logger.warning("AUTH RATELIMIT  hash=%.16s...  path=%s", khash, request.url.path)
+            raise HTTPException(status_code=429, detail="Daily rate limit exceeded")
+        logger.warning("AUTH REJECT  hash=%.16s...  reason=%s  path=%s", khash, reason, request.url.path)
         raise HTTPException(status_code=401, detail="Invalid API key or inactive account")
 
-    used = await auth_client.get_usage_count(khash)
-    if used >= metadata["daily_limit"]:
-        logger.warning(
-            "AUTH RATELIMIT  hash=%.16s...  used=%d  limit=%d",
-            khash, used, metadata["daily_limit"],
-        )
-        raise HTTPException(status_code=429, detail="Daily rate limit exceeded")
-
-    # Fire-and-forget analytics — don't await blocking path
-    await auth_client.record_analytics(khash, request.url.path, request.method, 200)
     logger.debug("AUTH OK  hash=%.16s...  path=%s", khash, request.url.path)
-    return metadata
+    return result
 
 
 async def admin_key_dep(
     x_admin_key: str = Header(..., alias="X-Admin-Key", description="System Master Key"),
 ) -> None:
-    if x_admin_key != APIBASE_MASTERKEY:
+    if not hmac.compare_digest(x_admin_key, APIBASE_MASTERKEY):
         logger.warning("ADMIN REJECT  bad master key")
         raise HTTPException(status_code=403, detail="Administrative access required")
 

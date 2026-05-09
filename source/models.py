@@ -1,10 +1,10 @@
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, Any, List
+from typing import Literal, Optional, Any
 
 class KeyRequest(BaseModel):
     email: EmailStr
     app_name: str
-    tier: str = "free"
+    tier: Literal["free", "standard", "pro"] = "free"
 
 class TrafficSubmission(BaseModel):
     lat: float
@@ -13,8 +13,8 @@ class TrafficSubmission(BaseModel):
     road_name: Optional[str] = None
 
 class IncidentSubmission(BaseModel):
-    lat: float
-    lon: float
+    lat: float = Field(..., ge=-90, le=90)
+    lon: float = Field(..., ge=-180, le=180)
     category: str
     details: str
 

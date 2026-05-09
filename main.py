@@ -10,7 +10,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
 
 from source.utils import gis_engine, ALLOWED_ORIGINS
-from auth import router as keys_router
+from auth import router as keys_router, auth_client
 from source.system import router as sys_router
 from source.spatial import router as spatial_router
 from source.websocket_routes import router as ws_router
@@ -120,15 +120,20 @@ async def lifespan(app: FastAPI):
         timeout=10.0,
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
     )
+    auth_client._client = httpx.AsyncClient(
+        timeout=8.0,
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=10)
+    )
     yield
     await gis_engine.client.aclose()
+    await auth_client.client.aclose()
     logger.info("ShorokAPI shutting down.")
 
 app = FastAPI(
     title="ShorokAPI Bangladesh",
     lifespan=lifespan,
     description=description,
-    version="2.2.0",
+    version="2.3.0",
     docs_url="/portal",
     redoc_url="/docs",
     openapi_tags=tags_metadata,

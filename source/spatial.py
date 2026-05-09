@@ -5,6 +5,7 @@ All endpoints query the shorokApi Supabase project via GISClient (utils.py).
 All endpoints require X-API-Key (validated against api(base) Supabase via auth.py).
 """
 
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -14,6 +15,11 @@ from source.models import IncidentSubmission, StandardResponse
 from source.utils import gis_engine, standardize_response, to_geojson
 
 router = APIRouter(prefix="/v1", tags=["Spatial Intelligence"])
+
+
+def _sanitize_ilike(value: str) -> str:
+    """Strip PostgREST ilike pattern special characters to prevent filter injection."""
+    return re.sub(r"[*()\\|]", "", value)
 
 
 # ─── Roads ────────────────────────────────────────────────────────────────────
@@ -27,18 +33,18 @@ async def get_roads(
 ):
     params: dict = {"select": "osm_id,fclass,name,wkt_geometry", "limit": limit, "offset": offset}
     if fclass:
-        params["fclass"] = f"eq.{fclass}"
+        params["fclass"] = f"eq.{_sanitize_ilike(fclass)}"
     if name:
-        params["name"] = f"ilike.*{name}*"
-    data = await gis_engine.fetch("roads", params)
+        params["name"] = f"ilike.*{_sanitize_ilike(name)}*"
+    data = await gis_engine.fetch("routes", params)
     return standardize_response(to_geojson(data, "wkt_geometry"))
 
 
 @router.get("/roads/nearby", summary="Find roads near coordinates", response_model=StandardResponse)
 async def get_roads_nearby(
-    lat:    float = Query(..., description="Latitude (WGS84)"),
-    lon:    float = Query(..., description="Longitude (WGS84)"),
-    radius: int   = Query(500, description="Search radius in meters"),
+    lat:    float = Query(..., ge=-90,  le=90,    description="Latitude (WGS84)"),
+    lon:    float = Query(..., ge=-180, le=180,   description="Longitude (WGS84)"),
+    radius: int   = Query(500, ge=1,   le=50_000, description="Search radius in meters"),
     _key:   dict  = Depends(api_key_dep),
 ):
     data = await gis_engine.rpc("get_nearby_roads", {"lat": lat, "lon": lon, "radius_meters": radius})
@@ -51,28 +57,29 @@ async def get_railways(
     limit: int  = Query(100, le=500),
     _key:  dict = Depends(api_key_dep),
 ):
-    params = {"select": "osm_id,fclass,name,wkt_geometry", "limit": limit}
+    params = {"select": "osm_id,fclass,name,geometry", "limit": limit}
     data = await gis_engine.fetch("railways", params)
-    return standardize_response(to_geojson(data, "wkt_geometry"))
+    return standardize_response(to_geojson(data, "geometry"))
 
 
 # ─── Search ───────────────────────────────────────────────────────────────────
 @router.get("/search", summary="Global spatial search", response_model=StandardResponse)
 async def search_spatial(
-    q:     str  = Query(..., description="Search term"),
+    q:     str  = Query(..., min_length=1, max_length=100, description="Search term"),
     limit: int  = Query(10, le=100),
     _key:  dict = Depends(api_key_dep),
 ):
-    params = {"select": "osm_id,fclass,name,wkt_geometry", "name": f"ilike.*{q}*", "limit": limit}
-    data = await gis_engine.fetch("roads", params)
+    safe_q = _sanitize_ilike(q)
+    params = {"select": "osm_id,fclass,name,wkt_geometry", "name": f"ilike.*{safe_q}*", "limit": limit}
+    data = await gis_engine.fetch("routes", params)
     return standardize_response(to_geojson(data, "wkt_geometry"))
 
 
 # ─── Geocoding ────────────────────────────────────────────────────────────────
 @router.get("/geocode/reverse", summary="Reverse geocode coordinates", response_model=StandardResponse)
 async def reverse_geocode(
-    lat:  float = Query(...),
-    lon:  float = Query(...),
+    lat:  float = Query(..., ge=-90,  le=90),
+    lon:  float = Query(..., ge=-180, le=180),
     _key: dict  = Depends(api_key_dep),
 ):
     data = await gis_engine.rpc("reverse_geocode", {"lat": lat, "lon": lon})
@@ -82,13 +89,12 @@ async def reverse_geocode(
 # ─── Traffic ──────────────────────────────────────────────────────────────────
 @router.get("/traffic", tags=["Traffic & Incidents"], summary="Live traffic segments", response_model=StandardResponse)
 async def get_traffic_status(
-    bbox:  Optional[str] = Query(None, description="Bounding box: minLon,minLat,maxLon,maxLat"),
+    _bbox: Optional[str] = Query(None, description="Bounding box: minLon,minLat,maxLon,maxLat"),
     limit: int           = Query(100, le=500),
     _key:  dict          = Depends(api_key_dep),
 ):
-    params: dict = {"select": "id,osm_id,congestion_level,geometry,updated_at", "limit": limit}
-    # TODO: add bbox filtering via PostGIS ST_MakeEnvelope RPC when available
-    data = await gis_engine.fetch("traffic_live", params)
+    params: dict = {"select": "id,osm_id,fclass,name,geometry,created_at", "limit": limit}
+    data = await gis_engine.fetch("traffic_data", params)
     return standardize_response(to_geojson(data, "geometry"))
 
 
@@ -110,12 +116,14 @@ async def get_stations(
 ):
     params: dict = {"limit": limit}
     if station_type:
-        params["fclass"] = f"eq.{station_type}"
-    data = await gis_engine.fetch("transport_points", params)
+        params["fclass"] = f"eq.{_sanitize_ilike(station_type)}"
+    data = await gis_engine.fetch("transport_data", params)
     return standardize_response(to_geojson(data, "geometry"))
 
 
 # ─── Routing ──────────────────────────────────────────────────────────────────
+VALID_PROFILES = {"driving", "cycling", "walking"}
+
 @router.get("/routes", tags=["Routing Engine"], summary="Point-to-point directions")
 async def calculate_route(
     start:   str  = Query(..., description="Start coords: lat,lon"),
@@ -123,6 +131,9 @@ async def calculate_route(
     profile: str  = Query("driving", description="Routing profile: driving, cycling, walking"),
     _key:    dict = Depends(api_key_dep),
 ):
+    if profile not in VALID_PROFILES:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=f"Invalid profile. Must be one of: {sorted(VALID_PROFILES)}")
     # OSRM integration placeholder — extend with actual OSRM call
     return standardize_response({"route": "calculated", "engine": profile, "start": start, "end": end})
 
